@@ -64,6 +64,7 @@ class Strategy:
     description: str   # 원리와 주의점
     params: list[Param] = field(default_factory=list)
     is_state: bool = False  # True면 '조건 충족 상태'를 보는 매매법(오늘 기준으로만 판단)
+    kind: str = "price"     # "price": 가격 데이터 기반 / "fundamental": 재무 데이터 기반(과거 검증 불가)
 
     def defaults(self, horizon: str) -> dict:
         return {p.key: p.default(horizon) for p in self.params}
@@ -90,6 +91,14 @@ def rsi(close: pd.DataFrame, n: int) -> pd.DataFrame:
     loss = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
     out = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
     return out.where(loss != 0, 100.0).where(gain.notna())
+
+
+def atr(P: Panel, n: int = 14) -> pd.DataFrame:
+    """평균 실제 변동폭(ATR, Wilder). 하루에 보통 얼마나 움직이는지를 가격 단위로 나타낸다."""
+    prev = P.close.shift(1)
+    tr = np.maximum(P.high - P.low, np.maximum((P.high - prev).abs(), (P.low - prev).abs()))
+    tr = pd.DataFrame(tr, index=P.close.index, columns=P.close.columns)
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
 def cross_up(a: pd.DataFrame, b: pd.DataFrame | float) -> pd.DataFrame:

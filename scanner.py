@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategies import Panel, Strategy
+from strategies import FundamentalStrategy, Panel, Strategy
 
 UNIVERSE_DIR = Path(__file__).resolve().parent / "universes"
 UNIVERSES = {
@@ -51,6 +51,31 @@ def download_panel(tickers: list[str], period: str = "3y") -> Panel:
     return Panel(get("Open"), get("High"), get("Low"), close.astype(float), get("Volume"))
 
 
+FUND_FIELDS = [
+    "trailingPE", "priceToBook", "debtToEquity", "returnOnEquity", "operatingMargins", "totalRevenue",
+    "enterpriseValue", "bookValue", "sharesOutstanding", "totalDebt", "totalCash", "dividendYield",
+    "payoutRatio", "fiveYearAvgDividendYield", "trailingPegRatio", "earningsGrowth", "sector", "marketCap",
+]
+
+
+def _fetch_info(ticker: str) -> dict:
+    import yfinance as yf
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        info = {}
+    return {"ticker": ticker, **{k: info.get(k) for k in FUND_FIELDS}}
+
+
+def download_fundamentals(tickers: list[str], workers: int = 16) -> pd.DataFrame:
+    """종목별 현재 재무 지표 (Yahoo Finance). 100종목에 수 초, 500종목에 30초 안팎."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(workers) as ex:
+        rows = list(ex.map(_fetch_info, tickers))
+    return pd.DataFrame(rows).set_index("ticker")
+
+
 @dataclass
 class Selection:
     strategy: Strategy
@@ -61,6 +86,8 @@ def evaluate(P: Panel, sels: list[Selection]) -> dict[str, tuple[pd.DataFrame, p
     """매매법별 (signal, strength) 표."""
     out = {}
     for s in sels:
+        if s.strategy.kind != "price":
+            continue
         r = s.strategy.compute(P, s.params)
         out[s.strategy.key] = (r.signal.astype(bool), r.strength.astype(float))
     return out
@@ -74,9 +101,16 @@ def active_mask(sig: pd.DataFrame, is_state: bool, recent: int) -> pd.DataFrame:
 
 
 def recommend(P: Panel, sels: list[Selection], universe: pd.DataFrame, mode: str, recent: int,
-              top_n: int, min_price: float = 5.0) -> pd.DataFrame:
-    """가장 최근 거래일 기준 추천 목록. mode: 'and' | 'score'."""
+              top_n: int, min_price: float = 5.0, F: pd.DataFrame | None = None) -> pd.DataFrame:
+    """가장 최근 거래일 기준 추천 목록. mode: 'and' | 'score'. F: 재무 표(재무 매매법을 고른 경우)."""
     results = evaluate(P, sels)
+    for s in sels:
+        if isinstance(s.strategy, FundamentalStrategy):
+            if F is None:
+                raise ValueError("재무 매매법에는 재무 데이터가 필요합니다.")
+            ok, strength = s.strategy.screen(F, s.params)
+            results[s.strategy.key] = (ok.reindex(P.tickers, fill_value=False).astype(bool),
+                                       strength.reindex(P.tickers, fill_value=0.0).astype(float))
     last = P.close.index[-1]
     tail = P.close.index[-recent:]
     rows = []
@@ -88,6 +122,13 @@ def recommend(P: Panel, sels: list[Selection], universe: pd.DataFrame, mode: str
         hits, scores = [], []
         for s in sels:
             sig, strength = results[s.strategy.key]
+            if s.strategy.kind == "fundamental":
+                if sig[t]:
+                    hits.append((s, last))
+                    scores.append(float(strength[t]))
+                else:
+                    scores.append(0.0)
+                continue
             col = sig[t]
             if s.strategy.is_state:
                 fired = [last] if col.iloc[-1] else []
